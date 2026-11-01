@@ -19,6 +19,13 @@ async fn health_check() -> &'static str {
 
 #[tokio::main]
 async fn main() {
+
+    // Loading environments variable
+    dotenvy::dotenv().ok();
+
+    // Verify the configuration is loaded
+    let budget = std::env::var("MAX_CONTEXT_MESSAGES").unwrap_or_else(|_| "6 (default)".to_string());
+    println!("⚙️ MAX_CONTEXT_MESSAGES loaded: {}", budget);
     println!("📦 Initializing local database...");
     
     // Step 1: Initialize the database layer via our `db` module

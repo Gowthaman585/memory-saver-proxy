@@ -23,3 +23,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Logging and debugging output
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+dotenvy = "0.15"
