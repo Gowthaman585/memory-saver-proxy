@@ -29,6 +29,14 @@ struct ChatResponse {
     message: ChatMessage,
 }
 
+/// Helper to estimate total tokens in a list of messages based on character length (~4 chars per token)
+fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+    let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+    total_chars / 4
+}
+
+
+
 /// Main handler for all proxied traffic. It reads the incoming request,
 /// logs messages, truncates context for VRAM efficiency, and forwards to Ollama.
 pub async fn proxy_handler(req: Request) -> impl IntoResponse {
@@ -59,17 +67,25 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             }
         }
 
-        // ✂️ BUDGETING / TRUNCATION LOGIC WITH CONFIGURABLE EVN LIMIT
+        // ✂ BUDGETING / TRUNCATION LOGIC WITH CONFIGURABLE EVN LIMIT
         let max_total_messages: usize = std::env::var("MAX_CONTEXT_MESSAGES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6);
+
+
+        let max_tokens: usize = std::env::var("MAX_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+
+
         if chat_req.messages.len() > max_total_messages {
             // Check if the very first message is a system prompt
             let has_system = chat_req.messages.first().map_or(false, |m| m.role == "system");
             
             if has_system {
-                println!("🛡️ System prompt detected! Preserving it in the context window.");
+                println!("🛡 System prompt detected! Preserving it in the context window.");
                 let system_msg = chat_req.messages.remove(0); // Safely take out the system prompt
                 
                 // Allow the remaining history to fit the rest of the budget
@@ -84,18 +100,45 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             } else {
                 // Standard truncation if no system prompt exists
                 println!(
-                    "✂️ Truncating context from {} to last {} messages to save VRAM",
+                    "✂ Truncating context from {} to last {} messages to save VRAM",
                     chat_req.messages.len(),
                     max_total_messages
                 );
                 let split_index = chat_req.messages.len() - max_total_messages;
                 chat_req.messages = chat_req.messages.split_off(split_index);
             }
+        }
 
-            // Re-serialize the modified request back into JSON bytes for Ollama
-            if let Ok(new_bytes) = serde_json::to_vec(&chat_req) {
-                modified_body_bytes = axum::body::Bytes::from(new_bytes);
+        // Enforce token budget across messages while preserving system prompt if present
+        let mut estimated_tokens = estimate_tokens(&chat_req.messages);
+        if estimated_tokens > max_tokens {
+            println!(
+                "⚠️ Payload token estimate (~{} tokens) exceeds max limit ({} tokens). Pruning older history...",
+                estimated_tokens, max_tokens
+            );
+
+            let has_system = chat_req.messages.first().map_or(false, |m| m.role == "system");
+            let system_msg = if has_system {
+                Some(chat_req.messages.remove(0))
+            } else {
+                None
+            };
+
+            while chat_req.messages.len() > 1 && estimate_tokens(&chat_req.messages) > max_tokens {
+                chat_req.messages.remove(0);
             }
+
+            if let Some(sys) = system_msg {
+                chat_req.messages.insert(0, sys);
+            }
+
+            estimated_tokens = estimate_tokens(&chat_req.messages);
+            println!("✂️ Context pruned to ~{} estimated tokens.", estimated_tokens);
+        }
+
+        // Re-serialize the modified request back into JSON bytes for Ollama
+        if let Ok(new_bytes) = serde_json::to_vec(&chat_req) {
+            modified_body_bytes = axum::body::Bytes::from(new_bytes);
         }
     }
 

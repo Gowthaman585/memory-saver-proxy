@@ -25,7 +25,10 @@ async fn main() {
 
     // Verify the configuration is loaded
     let budget = std::env::var("MAX_CONTEXT_MESSAGES").unwrap_or_else(|_| "6 (default)".to_string());
+    let token_budget = std::env::var("MAX_CONTEXT_TOKENS").unwrap_or_else(|_| "2048 (default)".to_string());
     println!("⚙️ MAX_CONTEXT_MESSAGES loaded: {}", budget);
+    println!("⚙️ MAX_CONTEXT_TOKENS loaded: {}", token_budget);
+    
     println!("📦 Initializing local database...");
     
     // Step 1: Initialize the database layer via our `db` module
