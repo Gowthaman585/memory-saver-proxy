@@ -2,7 +2,7 @@
 // MODULE: Transparent Proxy Pipe (proxy.rs)
 // Intercepts incoming HTTP requests, logs conversation history to SQLite,
 // applies prompt truncation/token budgeting, forwards requests to Ollama,
-// and captures assistant responses.
+// and captures assistant responses with latency tracking.
 // ============================================================================
 use axum::{
     body::Body,
@@ -21,6 +21,10 @@ struct ChatMessage {
 #[derive(Deserialize, Serialize, Debug)]
 struct ChatRequest {
     messages: Vec<ChatMessage>,
+    // 🛠 FIX: keep every other field (model, stream, options...) so that
+    // re-serializing the request for Ollama does not drop them.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // Struct to capture the assistant's response from Ollama
@@ -35,7 +39,25 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     total_chars / 4
 }
 
+/// 🛠 FIX: Ollama streams by default (one JSON object per line), so parsing the whole
+/// body as a single JSON fails. This reads line by line and joins the content chunks.
+/// Works for both streaming and non-streaming (`"stream": false`) responses.
+fn extract_reply(bytes: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut role = "assistant".to_string();
+    let mut content = String::new();
+    let mut found = false;
 
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(chunk) = serde_json::from_str::<ChatResponse>(line) {
+            role = chunk.message.role;
+            content.push_str(&chunk.message.content);
+            found = true;
+        }
+    }
+
+    if found { Some((role, content)) } else { None }
+}
 
 /// Main handler for all proxied traffic. It reads the incoming request,
 /// logs messages, truncates context for VRAM efficiency, and forwards to Ollama.
@@ -63,42 +85,39 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
         if let Ok(conn) = crate::db::init_db() {
             for msg in &chat_req.messages {
                 println!("💾 Logging message to DB [{}]: {}", msg.role, msg.content);
-                let _ = crate::db::insert_message(&conn, &msg.role, &msg.content);
+                // 🛠 FIX: report DB errors instead of silently swallowing them
+                if let Err(e) = crate::db::insert_message(&conn, &msg.role, &msg.content, None) {
+                    eprintln!("❌ DB insert error: {}", e);
+                }
             }
         }
 
-        // ✂ BUDGETING / TRUNCATION LOGIC WITH CONFIGURABLE EVN LIMIT
+        // ✂ BUDGETING / TRUNCATION LOGIC WITH CONFIGURABLE ENV LIMITS
         let max_total_messages: usize = std::env::var("MAX_CONTEXT_MESSAGES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6);
-
 
         let max_tokens: usize = std::env::var("MAX_CONTEXT_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048);
 
-
         if chat_req.messages.len() > max_total_messages {
-            // Check if the very first message is a system prompt
             let has_system = chat_req.messages.first().map_or(false, |m| m.role == "system");
             
             if has_system {
                 println!("🛡 System prompt detected! Preserving it in the context window.");
-                let system_msg = chat_req.messages.remove(0); // Safely take out the system prompt
+                let system_msg = chat_req.messages.remove(0);
                 
-                // Allow the remaining history to fit the rest of the budget
-                let max_history = max_total_messages - 1;
+                let max_history = if max_total_messages > 1 { max_total_messages - 1 } else { 0 };
                 if chat_req.messages.len() > max_history {
                     let split_index = chat_req.messages.len() - max_history;
                     chat_req.messages = chat_req.messages.split_off(split_index);
                 }
                 
-                // Put the system prompt back securely at index 0
                 chat_req.messages.insert(0, system_msg);
             } else {
-                // Standard truncation if no system prompt exists
                 println!(
                     "✂ Truncating context from {} to last {} messages to save VRAM",
                     chat_req.messages.len(),
@@ -145,9 +164,16 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
     // Build the outgoing request to Ollama using `modified_body_bytes`
     let mut forward_req = client.request(method, &backend_url);
     for (key, value) in headers.iter() {
+        // 🛠 FIX: skip headers that no longer match the rewritten body / backend host
+        if key == "content-length" || key == "host" {
+            continue;
+        }
         forward_req = forward_req.header(key, value);
     }
     forward_req = forward_req.body(modified_body_bytes);
+
+    // ⏱️ Start timer for latency measurement
+    let start_time = std::time::Instant::now();
 
     // Send the request and handle the backend's response
     match forward_req.send().await {
@@ -160,24 +186,36 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
                 Err(_) => return Response::builder().status(500).body(Body::from("Failed to read backend response")).unwrap(),
             };
 
-            // 🔍 Log incoming ASSISTANT response to DB!
-            if let Ok(chat_resp) = serde_json::from_slice::<ChatResponse>(&resp_bytes) {
+            // ⏱️ FIX: stop the timer AFTER the full body is received.
+            // `send().await` only waits for the response headers, which under-reports latency.
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+
+            // 🔍 Log incoming ASSISTANT response to DB with latency!
+            if let Some((role, content)) = extract_reply(&resp_bytes) {
                 if let Ok(conn) = crate::db::init_db() {
-                    println!("💾 Logging model response to DB: {}", chat_resp.message.content);
-                    let _ = crate::db::insert_message(&conn, &chat_resp.message.role, &chat_resp.message.content);
+                    // Terminal shows only the latency; the full reply text is still saved to the DB
+                    println!("⏱️ Ollama latency: {}ms (response saved to DB)", latency_ms);
+                    if let Err(e) = crate::db::insert_message(&conn, &role, &content, Some(latency_ms)) {
+                        eprintln!("❌ DB insert error: {}", e);
+                    }
                 }
             }
 
             // Reconstruct the response to send back to the user's tool
             let mut response_builder = Response::builder().status(status);
             for (key, value) in resp_headers.iter() {
+                // 🛠 FIX: body is re-sent as a whole, so drop transfer-encoding (chunked) header
+                if key == "transfer-encoding" {
+                    continue;
+                }
                 response_builder = response_builder.header(key, value);
             }
 
             response_builder.body(Body::from(resp_bytes)).unwrap()
         }
         Err(e) => {
-            eprintln!("❌ Proxy forwarding error: {}", e);
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            eprintln!("❌ Proxy forwarding error after {}ms: {}", latency_ms, e);
             Response::builder().status(502).body(Body::from(format!("Bad Gateway: {}", e))).unwrap()
         }
     }
