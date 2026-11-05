@@ -152,7 +152,7 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
                 chat_req.messages.insert(0, system_msg);
             } else {
                 println!(
-                    "✂ Truncating context from {} to last {} messages to save VRAM",
+                    "✂  Truncating context from {} to last {} messages to save VRAM",
                     chat_req.messages.len(),
                     max_total_messages
                 );
@@ -185,7 +185,7 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             }
 
             estimated_tokens = estimate_tokens(&chat_req.messages);
-            println!("✂ Context pruned to ~{} estimated tokens.", estimated_tokens);
+            println!("✂  Context pruned to ~{} estimated tokens.", estimated_tokens);
         }
 
         // Re-serialize the modified request back into JSON bytes for Ollama
