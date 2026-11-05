@@ -14,7 +14,7 @@ use axum::{
 
 /// Simple root endpoint to verify the server is live and responding.
 async fn health_check() -> &'static str {
-    "🤖 VRAM Saver Proxy is online and listening!"
+    "🤖 Memory Saver Proxy is online and listening!"
 }
 
 #[tokio::main]
