@@ -82,13 +82,46 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
     // 🔍 Single-pass parsing, logging, and VRAM budgeting
     if let Ok(mut chat_req) = serde_json::from_slice::<ChatRequest>(&body_bytes) {
         // Log all incoming messages to SQLite (full history preserved!)
+        let mut latest_user_query = String::new();
+        
         if let Ok(conn) = crate::db::init_db() {
             for msg in &chat_req.messages {
                 println!("💾 Logging message to DB [{}]: {}", msg.role, msg.content);
-                // 🛠 FIX: report DB errors instead of silently swallowing them
+                if msg.role == "user" {
+                    latest_user_query = msg.content.clone();
+                }
                 if let Err(e) = crate::db::insert_message(&conn, &msg.role, &msg.content, None) {
                     eprintln!("❌ DB insert error: {}", e);
                 }
+            }
+
+            // 🧠 AUGMENTED MEMORY RETRIEVAL (FTS5 Search Toggle)
+            let fts_enabled = std::env::var("FTS_ENABLED")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true);
+
+            if fts_enabled && !latest_user_query.is_empty() {
+                if let Ok(past_memories) = crate::db::search_messages(&conn, &latest_user_query, 3) {
+                    if !past_memories.is_empty() {
+                        println!("🧠 FTS5 Memory Retrieved: found {} relevant past snippets.", past_memories.len());
+                        
+                        let memory_context = format!(
+                            "[Long-Term Augmented Memory Context]:\n{}",
+                            past_memories.join("\n---\n")
+                        );
+
+                        // Inject the retrieved memory as a system message or context helper
+                        chat_req.messages.insert(
+                            0,
+                            ChatMessage {
+                                role: "system".to_string(),
+                                content: memory_context,
+                            },
+                        );
+                    }
+                }
+            } else if !fts_enabled {
+                println!("ℹ️ FTS5 Memory Retrieval is DISABLED via FTS_ENABLED=false");
             }
         }
 
@@ -107,7 +140,7 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             let has_system = chat_req.messages.first().map_or(false, |m| m.role == "system");
             
             if has_system {
-                println!("🛡 System prompt detected! Preserving it in the context window.");
+                println!("🛡 System prompt/memory detected! Preserving it in the context window.");
                 let system_msg = chat_req.messages.remove(0);
                 
                 let max_history = if max_total_messages > 1 { max_total_messages - 1 } else { 0 };
@@ -128,11 +161,11 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             }
         }
 
-        // Enforce token budget across messages while preserving system prompt if present
+        // Enforce token budget across messages while preserving system prompt/memory if present
         let mut estimated_tokens = estimate_tokens(&chat_req.messages);
         if estimated_tokens > max_tokens {
             println!(
-                "⚠️ Payload token estimate (~{} tokens) exceeds max limit ({} tokens). Pruning older history...",
+                "⚠ Payload token estimate (~{} tokens) exceeds max limit ({} tokens). Pruning older history...",
                 estimated_tokens, max_tokens
             );
 
@@ -152,7 +185,7 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
             }
 
             estimated_tokens = estimate_tokens(&chat_req.messages);
-            println!("✂️ Context pruned to ~{} estimated tokens.", estimated_tokens);
+            println!("✂ Context pruned to ~{} estimated tokens.", estimated_tokens);
         }
 
         // Re-serialize the modified request back into JSON bytes for Ollama
@@ -164,7 +197,6 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
     // Build the outgoing request to Ollama using `modified_body_bytes`
     let mut forward_req = client.request(method, &backend_url);
     for (key, value) in headers.iter() {
-        // 🛠 FIX: skip headers that no longer match the rewritten body / backend host
         if key == "content-length" || key == "host" {
             continue;
         }
@@ -172,7 +204,7 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
     }
     forward_req = forward_req.body(modified_body_bytes);
 
-    // ⏱️ Start timer for latency measurement
+    // ⏱ Start timer for latency measurement
     let start_time = std::time::Instant::now();
 
     // Send the request and handle the backend's response
@@ -186,25 +218,20 @@ pub async fn proxy_handler(req: Request) -> impl IntoResponse {
                 Err(_) => return Response::builder().status(500).body(Body::from("Failed to read backend response")).unwrap(),
             };
 
-            // ⏱️ FIX: stop the timer AFTER the full body is received.
-            // `send().await` only waits for the response headers, which under-reports latency.
             let latency_ms = start_time.elapsed().as_millis() as u64;
 
             // 🔍 Log incoming ASSISTANT response to DB with latency!
             if let Some((role, content)) = extract_reply(&resp_bytes) {
                 if let Ok(conn) = crate::db::init_db() {
-                    // Terminal shows only the latency; the full reply text is still saved to the DB
-                    println!("⏱️ Ollama latency: {}ms (response saved to DB)", latency_ms);
+                    println!("⏱ Ollama latency: {}ms (response saved to DB)", latency_ms);
                     if let Err(e) = crate::db::insert_message(&conn, &role, &content, Some(latency_ms)) {
                         eprintln!("❌ DB insert error: {}", e);
                     }
                 }
             }
 
-            // Reconstruct the response to send back to the user's tool
             let mut response_builder = Response::builder().status(status);
             for (key, value) in resp_headers.iter() {
-                // 🛠 FIX: body is re-sent as a whole, so drop transfer-encoding (chunked) header
                 if key == "transfer-encoding" {
                     continue;
                 }
